@@ -108,6 +108,16 @@ final class SpoofSession: ObservableObject {
     @Published var isBusy = false
     @Published var joystickActive = false
 
+    // Observed aircraft follow (free ADS-B feed). These are reported measurements,
+    // not GPS altitude/speed injected into other applications.
+    @Published private(set) var liveFlightHex: String?
+    @Published private(set) var liveFlightAircraft: ObservedAircraft?
+    @Published private(set) var liveFlightStatus = ""
+    private var liveFlightTask: Task<Void, Never>?
+    private var liveFrom: MotionPoint?
+    private var liveTo: MotionPoint?
+    private var liveBlendStarted: TimeInterval = 0
+
     @Published var favorites: [SavedPlace] = []
     @Published var recents: [SavedPlace] = []
 
@@ -226,6 +236,7 @@ final class SpoofSession: ObservableObject {
     }
 
     private func cancelMovement() {
+        stopFreeLiveFlight()
         cancelConnectionAttempt()
         routeSimulation.clear()
         travelDynamics.reset()
@@ -251,6 +262,63 @@ final class SpoofSession: ObservableObject {
             if let airportPlan { travelDynamics.configureAirport(airportPlan.stages) }
             lastMotionTime = ProcessInfo.processInfo.systemUptime
         }
+    }
+
+    /// Start following one observed aircraft. Explicitly replaces any running route;
+    /// follow reports can lag by around 3 minutes to respect the free daily quota.
+    func startFreeLiveFlight(_ first: ObservedAircraft, pairing: PairingStore) {
+        guard pairing.hasPairingFile else {
+            lastError = String(localized: "Import an RPPairing file in Settings first.")
+            return
+        }
+        cancelMovement()
+        travelMode = .flight
+        startAfterResolving { [self] in
+            apply(first.coordinate, pairing: pairing, markRecent: true)
+            guard status == .active else { return }
+            liveFlightHex = first.hex
+            liveFlightAircraft = first
+            liveFlightStatus = "Connected; following observed ADS-B fixes (3-minute polling)."
+            liveFrom = MotionPoint(first.coordinate)
+            liveTo = MotionPoint(first.coordinate)
+            liveBlendStarted = ProcessInfo.processInfo.systemUptime
+            liveFlightTask = Task { [weak self] in
+                while !Task.isCancelled {
+                    guard let self, self.liveFlightHex == first.hex else { break }
+                    do {
+                        let reported = try await FreeFlightFeeds.byHex(first.hex)
+                        guard !Task.isCancelled, self.liveFlightHex == first.hex else { break }
+                        // Blend the previous simulated GPS point toward the new observation.
+                        // This avoids instant long-range teleports but is NOT exact live position.
+                        if let current = self.idealCoordinate {
+                            self.liveFrom = MotionPoint(current)
+                            self.liveTo = MotionPoint(reported.coordinate)
+                            self.liveBlendStarted = ProcessInfo.processInfo.systemUptime
+                        }
+                        self.liveFlightAircraft = reported
+                        self.liveFlightStatus = "Observed position refreshed; \(Int(reported.ageSeconds))s old. Smooth delayed follow active."
+                    } catch {
+                        guard !Task.isCancelled else { break }
+                        self.liveFlightStatus = "Live feed unavailable: \(error.localizedDescription). Last reported location held."
+                    }
+                    // 180s polling keeps continuous tracking to at most 480 requests/day,
+                    // leaving a small fraction of the 500/day no-key quota for discovery.
+                    try? await Task.sleep(nanoseconds: 180_000_000_000)
+                }
+            }
+        }
+    }
+
+    /// Stop following the aircraft; the last simulated coordinate is retained.
+    /// The normal End spoofing control restores physical GPS.
+    func stopFreeLiveFlight() {
+        liveFlightTask?.cancel()
+        liveFlightTask = nil
+        liveFlightHex = nil
+        liveFlightAircraft = nil
+        liveFlightStatus = ""
+        liveFrom = nil
+        liveTo = nil
     }
 
     var travelStatusDescription: String {
@@ -448,7 +516,19 @@ final class SpoofSession: ObservableObject {
         var next = MotionPoint(ideal)
         var moved = false
         var advancedRoute: RouteSimulation?
-        if routeSimulation.phase == .running {
+        if liveFlightHex != nil, let from = liveFrom, let target = liveTo {
+            // Follow historical ADS-B fixes smoothly with deliberate latency.
+            let fraction = min(1, max(0, (now - liveBlendStarted) / 180))
+            let desired = from.interpolated(to: target, fraction: fraction)
+            let separation = next.distance(to: desired)
+            // On an iOS foreground resume, don't jump across the entire missed interval.
+            if separation > 0.35 {
+                let maxStep = max(0, min(1, dt)) * 300
+                next = next.interpolated(to: desired,
+                    fraction: min(1, maxStep / separation))
+                moved = true
+            }
+        } else if routeSimulation.phase == .running {
             var candidate = routeSimulation
             let distance = travelDynamics.advanceDistance(
                 mode: travelMode,

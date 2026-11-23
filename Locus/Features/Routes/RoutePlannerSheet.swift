@@ -26,6 +26,7 @@ struct RoutePlannerSheet: View {
     @EnvironmentObject private var session: SpoofSession
     @Environment(\.dismiss) private var dismiss
     @State private var showAirportIntelligence = false
+    @State private var showFreeRealFlights = false
 
     var body: some View {
         NavigationStack {
@@ -35,7 +36,21 @@ struct RoutePlannerSheet: View {
                         RoutePlaybackControls()
                     }
                 }
+                if session.liveFlightHex != nil {
+                    Section("Following an observed aircraft") {
+                        Text(session.liveFlightStatus).font(.caption).foregroundStyle(.secondary)
+                        if let observed = session.liveFlightAircraft {
+                            Text("\(observed.callsign) • \(observed.hex)")
+                        }
+                        Button(role: .destructive) { session.stopFreeLiveFlight() } label: {
+                            Label("Stop live following — hold GPS", systemImage: "stop.fill")
+                        }
+                    }
+                }
                 Section("Airport Intelligence") {
+                    Button { showFreeRealFlights = true } label: {
+                        Label("FREE Real Flights — live aircraft and airport map", systemImage: "airplane.circle")
+                    }
                     Button { showAirportIntelligence = true } label: {
                         Label("Plan airport → flight → arrival", systemImage: "airplane.departure")
                     }
@@ -161,6 +176,9 @@ struct RoutePlannerSheet: View {
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
+            }
+            .sheet(isPresented: $showFreeRealFlights) {
+                FreeRealFlightsSheet()
             }
             .sheet(isPresented: $showAirportIntelligence) {
                 AirportIntelligenceSheet { plan, startNow in
