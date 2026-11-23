@@ -95,7 +95,11 @@ struct RoutePlannerSheet: View {
                         Button(String(localized: "Cancel route build"), role: .cancel, action: onCancelBuild)
                     } else {
                         Button(action: onBuild) {
-                            Label(String(localized: "Build connected route"), systemImage: "road.lanes")
+                            if session.travelMode == .flight || session.travelMode == .ship {
+                                Label(String(localized: "Build direct waypoint route"), systemImage: "point.topleft.down.to.point.bottomright.curvepath")
+                            } else {
+                                Label(String(localized: "Build connected route"), systemImage: "road.lanes")
+                            }
                         }
                         .disabled(stops.count < 2)
                     }
@@ -110,7 +114,13 @@ struct RoutePlannerSheet: View {
                     }
                     .disabled(isRouting || !hasPreparedRoute || session.routeSimulation.canStop)
                 } footer: {
-                    Text(String(localized: "Editing stops or the road type requires rebuilding. Your current running or paused route is kept until you stop it."))
+                    if session.travelMode == .flight || session.travelMode == .ship {
+                        Text(String(localized: "Flight and ship routes join waypoints directly. Add intermediate waypoints; a straight ship route might cross land. This is a simulation, not a navigation service."))
+                    } else if session.travelMode == .realisticDrive {
+                        Text(String(localized: "Driving follows Apple Maps roads, with simulated stops near some sharp junction turns. These are not actual traffic-light states or live traffic reports."))
+                    } else {
+                        Text(String(localized: "Editing stops or the road type requires rebuilding. Your current running or paused route is kept until you stop it."))
+                    }
                 }
 
                 Section(String(localized: "Draw / GPX")) {
@@ -179,6 +189,17 @@ struct RoutePlaybackControls: View {
                     Text(session.routeSimulation.progress.formatted(.percent.precision(.fractionLength(0))))
                         .font(.caption.monospacedDigit())
                         .foregroundStyle(.secondary)
+                    if !session.travelStatusDescription.isEmpty {
+                        Text(session.travelStatusDescription)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    if session.travelMode == .flight {
+                        Text(String(format: String(localized: "Estimated altitude: %.0f m (display only)"),
+                                    session.estimatedFlightAltitude))
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 if session.routeSimulation.phase == .running {

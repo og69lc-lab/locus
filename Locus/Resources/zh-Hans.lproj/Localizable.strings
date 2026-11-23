@@ -255,3 +255,19 @@
 "Remote Pairing ports can change. Automatic mode uses the last working port, then discovers this device’s service via Bonjour. If discovery is unavailable, enter the same port used by SideStore. The VPN route and IP stay unchanged. Allow Local Network access for Locus or its container. Stop spoofing before editing." = "Remote Pairing 服务端口可能变化。自动模式先尝试上次可用端口，再通过 Bonjour 查找本机服务。如无法发现，可填写 SideStore 当前使用的端口，无需更改 VPN 路由或 IP。请允许 Locus 或其所在容器访问“本地网络”。更改前请先结束定位。";
 "Could not establish Remote Pairing. Check the service port and this app’s RPPairing file; a working VPN route alone does not verify them." = "无法建立 Remote Pairing 连接。请核对服务端口及本应用导入的 RPPairing 文件；VPN 路由正常并不能验证这两项。";
 "Endpoint %@ · native error %d/%d" = "连接端点 %@ · 原生错误码 %d/%d";
+
+// Travel simulation profiles (estimated movement; not live traffic)
+"Traffic drive" = "交通驾驶";
+"Airplane" = "飞机";
+"Ship" = "船舶";
+"Taxi / takeoff" = "滑行 / 起飞";
+"Approach / landing" = "进近 / 降落";
+"Cruising" = "巡航";
+"Approaching port" = "靠近港口";
+"At sea" = "海上航行";
+"Simulated junction stop" = "模拟路口停车";
+"Traffic-style driving" = "模拟交通驾驶";
+"Build direct waypoint route" = "建立航点直线路线";
+"Flight and ship routes join waypoints directly. Add intermediate waypoints; a straight ship route might cross land. This is a simulation, not a navigation service." = "飞机和船舶路线以直线连接航点。请添加中间航点；船舶直线路线可能穿过陆地。这是模拟功能，并非导航服务。";
+"Driving follows Apple Maps roads, with simulated stops near some sharp junction turns. These are not actual traffic-light states or live traffic reports." = "驾驶路线沿 Apple 地图道路行驶，并在部分急转弯路口附近模拟停车。这些不代表真实红绿灯状态或实时路况。";
+"Estimated altitude: %.0f m (display only)" = "估计高度：%.0f 米（仅用于显示）";

@@ -169,6 +169,13 @@ struct MapHomeView: View {
             routeCoords.removeAll()
             preparedDistance = 0
         }
+        .onChange(of: session.travelMode) { _, _ in
+            if routeIsRoadRoute || isRouting {
+                cancelRoadBuild()
+                routeCoords.removeAll()
+                preparedDistance = 0
+            }
+        }
         .onChange(of: session.roadTransportType.rawValue) { _, _ in
             if isRouting || routeIsRoadRoute {
                 cancelRoadBuild()
@@ -501,6 +508,20 @@ struct MapHomeView: View {
             return
         }
         cancelRoadBuild()
+        if session.travelMode == .flight || session.travelMode == .ship {
+            let spacing = session.travelMode == .flight ? 5000.0 : 500.0
+            // No MapKit airplane/boat routing API: explicitly connect user waypoints.
+            var legs: [[MotionPoint]] = []
+            for (start, end) in zip(points, points.dropFirst()) {
+                let distance = start.distance(to: end)
+                let count = max(1, Int(ceil(distance / spacing)))
+                legs.append((0...count).map { step in
+                    start.interpolated(to: end, fraction: Double(step) / Double(count))
+                })
+            }
+            setPreparedRoute(RouteGeometry.joined(legs).map(\.coordinate), isRoad: false)
+            return
+        }
         let requestID = routeBuildID
         let transportType = session.roadTransportType
         isRouting = true
