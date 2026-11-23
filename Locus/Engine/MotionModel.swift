@@ -13,7 +13,7 @@ struct MotionSettings: Codable, Equatable {
 
     var normalized: MotionSettings {
         var copy = self
-        copy.customSpeedKPH = Self.clamp(customSpeedKPH, to: 0.1...300, fallback: 5)
+        copy.customSpeedKPH = Self.clamp(customSpeedKPH, to: 0.1...2000, fallback: 5)
         copy.driftRadius = Self.clamp(driftRadius, to: 1...100, fallback: 3)
         copy.speedVariationPercent = Self.clamp(speedVariationPercent, to: 0...90, fallback: 10)
         return copy
