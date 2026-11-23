@@ -10,10 +10,12 @@ struct RoutePlannerSheet: View {
     var hasPreparedRoute: Bool
     var hasDrawnPath: Bool
     var preparedDistance: Double
+    var airportPlan: AirportGeneratedPlan?
     var canUsePin: Bool
     var onAddPin: () -> Void
     var onAddCurrent: () -> Void
     var onPickOnMap: () -> Void
+    var onAirportFlight: (AirportGeneratedPlan, Bool) -> Void
     var onBuild: () -> Void
     var onCancelBuild: () -> Void
     var onPlay: () -> Void
@@ -23,6 +25,7 @@ struct RoutePlannerSheet: View {
 
     @EnvironmentObject private var session: SpoofSession
     @Environment(\.dismiss) private var dismiss
+    @State private var showAirportIntelligence = false
 
     var body: some View {
         NavigationStack {
@@ -30,6 +33,23 @@ struct RoutePlannerSheet: View {
                 if session.routeSimulation.phase != .idle {
                     Section(String(localized: "Current route")) {
                         RoutePlaybackControls()
+                    }
+                }
+                Section("Airport Intelligence") {
+                    Button { showAirportIntelligence = true } label: {
+                        Label("Plan airport → flight → arrival", systemImage: "airplane.departure")
+                    }
+                    Text("Search airports by IATA/ICAO or city, select an aircraft, configure terminal holds and optionally add hotel transfers. The flight is a simulation, not airport navigation.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                    if let airportPlan {
+                        Text("\(airportPlan.departure.id) → \(airportPlan.destination.id)")
+                            .font(.headline)
+                        LabeledContent("Aircraft", value: airportPlan.aircraft.name)
+                        LabeledContent("Estimated journey duration",value:String(format:"%.0f min",airportPlan.approximateSeconds/60))
+                        if !airportPlan.departureTerminal.isEmpty { LabeledContent("Departure terminal",value:airportPlan.departureTerminal) }
+                        if !airportPlan.departureGate.isEmpty { LabeledContent("Departure gate",value:airportPlan.departureGate) }
+                        if !airportPlan.arrivalTerminal.isEmpty { LabeledContent("Arrival terminal",value:airportPlan.arrivalTerminal) }
+                        if !airportPlan.arrivalGate.isEmpty { LabeledContent("Arrival gate",value:airportPlan.arrivalGate) }
                     }
                 }
                 Section(String(localized: "Movement speed")) {
@@ -140,6 +160,11 @@ struct RoutePlannerSheet: View {
                     Text(String(localized: "Pause and Stop route keep your simulated location here. End spoofing restores real GPS. Enabled drift remains centered on the held location."))
                         .font(.footnote)
                         .foregroundStyle(.secondary)
+                }
+            }
+            .sheet(isPresented: $showAirportIntelligence) {
+                AirportIntelligenceSheet { plan, startNow in
+                    onAirportFlight(plan, startNow)
                 }
             }
             .navigationTitle(String(localized: "Routes"))

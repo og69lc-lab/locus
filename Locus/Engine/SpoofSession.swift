@@ -117,6 +117,7 @@ final class SpoofSession: ObservableObject {
     private var healthTimer: Timer?
     private var motionTimer: Timer?
     @Published private(set) var routeSimulation = RouteSimulation()
+    @Published private(set) var activeAirportJourney: AirportGeneratedPlan?
     private var variation = MotionVariation()
     private var travelDynamics = TravelDynamics()
     private var driftOffset = (east: 0.0, north: 0.0)
@@ -228,10 +229,12 @@ final class SpoofSession: ObservableObject {
         cancelConnectionAttempt()
         routeSimulation.clear()
         travelDynamics.reset()
+        activeAirportJourney = nil
         stopJoystick()
     }
 
-    func followRoute(_ coordinates: [CLLocationCoordinate2D], pairing: PairingStore) {
+    func followRoute(_ coordinates: [CLLocationCoordinate2D], pairing: PairingStore,
+                     airportPlan: AirportGeneratedPlan? = nil) {
         guard pairing.hasPairingFile else {
             lastError = String(localized: "Import an RPPairing file in Settings first.")
             return
@@ -239,17 +242,20 @@ final class SpoofSession: ObservableObject {
         var next = RouteSimulation()
         guard next.start(points: coordinates.map(MotionPoint.init)) else { return }
         cancelMovement()
+        activeAirportJourney = airportPlan
         startAfterResolving { [self] in
             apply(coordinates[0], pairing: pairing, markRecent: true)
             guard status == .active else { return }
             routeSimulation = next
             travelDynamics.reset(route: next.path)
+            if let airportPlan { travelDynamics.configureAirport(airportPlan.stages) }
             lastMotionTime = ProcessInfo.processInfo.systemUptime
         }
     }
 
     var travelStatusDescription: String {
-        travelDynamics.status(mode: travelMode,
+        if let label = travelDynamics.airportStageLabel { return label }
+        return travelDynamics.status(mode: travelMode,
                               travelled: routeSimulation.travelledDistance,
                               total: routeSimulation.totalDistance)
     }
@@ -601,6 +607,10 @@ extension MotionPoint {
 private struct TravelDynamics {
     private var currentSpeed: Double = 0
     private var junctionDistances: [Double] = []
+    private var airportStages: [AirportJourneyStage] = []
+    private var airportIndex = 0
+    private var airportHoldRemaining = 0.0
+    private var airportStageEntered = false
     private var nextJunction = 0
     private var waitingSeconds: Double = 0
     private(set) var estimatedFlightAltitude: Double = 0
@@ -613,6 +623,27 @@ private struct TravelDynamics {
         waitingSeconds = 0
         estimatedFlightAltitude = 0
         isWaiting = false
+        airportStages = []
+        airportIndex = 0
+        airportHoldRemaining = 0
+        airportStageEntered = false
+    }
+
+    mutating func configureAirport(_ stages: [AirportJourneyStage]) {
+        airportStages = stages
+        airportIndex = 0
+        airportHoldRemaining = 0
+        airportStageEntered = false
+        currentSpeed = 0
+    }
+
+    var airportStageLabel: String? {
+        guard !airportStages.isEmpty else { return nil }
+        let index = min(airportIndex, airportStages.count - 1)
+        if airportHoldRemaining > 0 {
+            return "Airport hold · \(Int(ceil(airportHoldRemaining / 60))) min remaining"
+        }
+        return airportStages[index].kind.label
     }
 
     mutating func advanceDistance(mode: TravelMode, baseSpeed: Double, seconds: Double,
@@ -620,6 +651,9 @@ private struct TravelDynamics {
         // Avoid giant jumps following an iOS suspension/resume.
         let dt = min(1.0, max(0.0, seconds))
         guard dt > 0, total > 0 else { return 0 }
+        if !airportStages.isEmpty {
+            return airportAdvance(seconds: dt, travelled: travelled, variation: variation)
+        }
         let remaining = max(0, total - travelled)
         var target = max(0, baseSpeed * variation)
         var acceleration = 2.0
@@ -686,6 +720,50 @@ private struct TravelDynamics {
         var move = min(remaining, currentSpeed * dt)
         if mode == .realisticDrive && nextJunction < junctionDistances.count {
             move = min(move, max(0, junctionDistances[nextJunction] - travelled))
+        }
+        return move
+    }
+
+    private mutating func airportAdvance(seconds dt: Double, travelled: Double, variation: Double) -> Double {
+        while airportIndex < airportStages.count - 1 &&
+              travelled >= airportStages[airportIndex].endDistance - 0.01 {
+            airportIndex += 1
+            airportStageEntered = false
+        }
+        guard airportIndex < airportStages.count else { return 0 }
+        let stage = airportStages[airportIndex]
+        if !airportStageEntered {
+            airportStageEntered = true
+            airportHoldRemaining = stage.holdBeforeSeconds
+        }
+        if airportHoldRemaining > 0 {
+            airportHoldRemaining = max(0, airportHoldRemaining - dt)
+            currentSpeed = 0
+            return 0
+        }
+        let previousEnd = airportIndex == 0 ? 0 : airportStages[airportIndex - 1].endDistance
+        let legDistance = max(1, stage.endDistance - previousEnd)
+        let along = max(0, travelled - previousEnd)
+        let remaining = max(0, stage.endDistance - travelled)
+        let braking = stage.kind.braking
+        var target = max(0.5, stage.speed * variation)
+        // Smooth arrivals and stage transitions, particularly before holds.
+        if stage.kind != .cruise {
+            target = min(target, max(1, sqrt(2 * braking * max(remaining, 0.5))))
+        }
+        let delta = target - currentSpeed
+        currentSpeed = max(0, currentSpeed + max(-braking * dt, min(stage.kind.accel * dt, delta)))
+        let move = min(remaining, currentSpeed * dt)
+        switch stage.kind {
+        case .takeoff:
+            estimatedFlightAltitude = 1800 * min(1, along / legDistance)
+        case .cruise:
+            let climb = max(1, min(160_000, legDistance * 0.28))
+            estimatedFlightAltitude = 1800 + 9200 * min(1, along / climb)
+        case .approach:
+            estimatedFlightAltitude = 11000 * max(0, 1 - along / legDistance)
+        case .driveToAirport, .taxiOut, .taxiIn, .driveToHotel:
+            estimatedFlightAltitude = 0
         }
         return move
     }

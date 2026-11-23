@@ -21,6 +21,8 @@ struct MapHomeView: View {
     @State private var preparedDistance = 0.0
     @State private var pendingGPXImport = false
     @State private var routeCoords: [CLLocationCoordinate2D] = []
+    @State private var preparedAirportJourney: AirportGeneratedPlan?
+    @State private var pendingAirportStopChange: AirportGeneratedPlan?
     @State private var isRouting = false
     @State private var showRouteSheet = false
     @State private var showGPXImporter = false
@@ -166,10 +168,21 @@ struct MapHomeView: View {
         }
         .onChange(of: routeStops) { _, _ in
             cancelRoadBuild()
-            routeCoords.removeAll()
-            preparedDistance = 0
+            if let pendingAirportStopChange {
+                self.pendingAirportStopChange = nil
+                setPreparedRoute(pendingAirportStopChange.route, isRoad: false)
+            } else {
+                preparedAirportJourney = nil
+                routeCoords.removeAll()
+                preparedDistance = 0
+            }
         }
-        .onChange(of: session.travelMode) { _, _ in
+        .onChange(of: session.travelMode) { _, mode in
+            if mode != .flight && preparedAirportJourney != nil {
+                preparedAirportJourney = nil
+                routeCoords.removeAll()
+                preparedDistance = 0
+            }
             if routeIsRoadRoute || isRouting {
                 cancelRoadBuild()
                 routeCoords.removeAll()
@@ -213,6 +226,7 @@ struct MapHomeView: View {
             hasPreparedRoute: routeCoords.count >= 2,
             hasDrawnPath: drawnPath.count >= 2,
             preparedDistance: preparedDistance,
+            airportPlan: preparedAirportJourney,
             canUsePin: session.pin != nil,
             onAddPin: {
                 if let pin = session.pin { addRouteStop(pin, name: pinPlaceName ?? "") }
@@ -229,6 +243,32 @@ struct MapHomeView: View {
                 routePicking = true
                 showRouteSheet = false
             },
+            onAirportFlight: { plan, startNow in
+                cancelRoadBuild()
+                session.travelMode = .flight
+                preparedAirportJourney = plan
+                pendingAirportStopChange = plan
+                var newStops: [RouteStop] = []
+                func appendStop(_ coordinate: CLLocationCoordinate2D, name: String) {
+                    let point = MotionPoint(coordinate)
+                    if newStops.last.map({ $0.point.distance(to: point) > 2 }) ?? true {
+                        newStops.append(RouteStop(point: point, name: name))
+                    }
+                }
+                if let first = plan.route.first {
+                    appendStop(first, name: plan.stages.first?.kind == .driveToAirport ? "Starting address" : plan.departure.displayName)
+                }
+                appendStop(plan.departure.coordinate, name: plan.departure.displayName)
+                appendStop(plan.destination.coordinate, name: plan.destination.displayName)
+                if let last = plan.route.last {
+                    appendStop(last, name: plan.stages.last?.kind == .driveToHotel ? "Destination address" : plan.destination.displayName)
+                }
+                routeStops = newStops
+                setPreparedRoute(plan.route, isRoad: false)
+                position = .region(MKCoordinateRegion(center: plan.departure.coordinate,
+                    latitudinalMeters: 20000, longitudinalMeters: 20000))
+                if startNow { session.followRoute(plan.route, pairing: pairing, airportPlan: plan) }
+            },
             onBuild: buildRoadRoute,
             onCancelBuild: cancelRoadBuild,
             onPlay: playRoute,
@@ -239,6 +279,7 @@ struct MapHomeView: View {
             onExportGPX: exportGPX,
             onUseDrawn: {
                 cancelRoadBuild()
+                preparedAirportJourney = nil
                 setPreparedRoute(RouteBuilder.sample(coordinates: drawnPath, every: 10), isRoad: false)
                 drawnPath.removeAll()
                 drawMode = false
@@ -502,6 +543,7 @@ struct MapHomeView: View {
     }
 
     private func buildRoadRoute() {
+        preparedAirportJourney = nil
         let points = RouteGeometry.distinctStops(routeStops.map(\.point))
         guard points.count >= 2 else {
             routeBuildError = String(localized: "Add at least two different route stops.")
@@ -551,7 +593,7 @@ struct MapHomeView: View {
             session.lastError = String(localized: "Build or draw a route first.")
             return
         }
-        session.followRoute(routeCoords, pairing: pairing)
+        session.followRoute(routeCoords, pairing: pairing, airportPlan: preparedAirportJourney)
         if session.status == .active || session.isBusy { showRouteSheet = false }
     }
 
@@ -559,6 +601,7 @@ struct MapHomeView: View {
         do {
             let coords = try GPXCodec.parse(url)
             cancelRoadBuild()
+            preparedAirportJourney = nil
             setPreparedRoute(RouteBuilder.sample(coordinates: coords, every: 10), isRoad: false)
             drawnPath.removeAll()
             drawMode = false
