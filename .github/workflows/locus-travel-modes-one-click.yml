@@ -1,0 +1,443 @@
+name: Prepare Locus travel modes upgrade
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out your fork
+        uses: actions/checkout@v4
+      - name: Apply travel mode changes
+        shell: bash
+        run: |
+          cat > upgrade_locus_travel_modes.py <<'PY'
+          #!/usr/bin/env python3
+          """Locus travel profiles upgrade for og69lc-lab/locus (source fork Nov 2026).
+
+          Run from the repository root: python3 upgrade_locus_travel_modes.py
+          The script never touches pairing files or device settings. It fails if expected
+          source text changed, and does not overwrite source files until all replacements
+          are validated. Back up or commit any local edits before running.
+          """
+          from pathlib import Path
+
+          ROOT = Path(__file__).resolve().parent
+
+
+          def change(text, old, new, filename):
+              count = text.count(old)
+              if count != 1:
+                  raise RuntimeError(f"{filename}: expected exactly one occurrence; got {count}: {old[:90]!r}")
+              return text.replace(old, new, 1)
+
+
+          changes = {}
+
+          # ----- Engine / travel modes -----
+          path = Path('Locus/Engine/SpoofSession.swift')
+          s = (ROOT / path).read_text()
+          s = change(s, 'case walk, run, cycle, drive, custom',
+                     'case walk, run, cycle, drive, realisticDrive, flight, ship, custom', path)
+          s = change(s, '''        case .drive: return String(localized: "Drive")
+                  case .custom: return String(localized: "Custom")''',
+          '''        case .drive: return String(localized: "Drive")
+                  case .realisticDrive: return String(localized: "Traffic drive")
+                  case .flight: return String(localized: "Airplane")
+                  case .ship: return String(localized: "Ship")
+                  case .custom: return String(localized: "Custom")''',path)
+          s = change(s, '''        case .drive: return "car.fill"
+                  case .custom: return "speedometer"''',
+          '''        case .drive: return "car.fill"
+                  case .realisticDrive: return "car.side.fill"
+                  case .flight: return "airplane"
+                  case .ship: return "ferry.fill"
+                  case .custom: return "speedometer"''',path)
+          s = change(s, '''        case .drive: return 13.4
+                  case .custom: return 5.0 / 3.6''',
+          '''        case .drive, .realisticDrive: return 13.4
+                  case .flight: return 235.0  // 846 km/h cruise; profile handles departure and arrival
+                  case .ship: return 9.0     // 32.4 km/h cruise; profile handles ports
+                  case .custom: return 5.0 / 3.6''',path)
+          s = change(s, '''        case .walk, .run, .custom: return .walking
+                  case .cycle, .drive: return .automobile''',
+          '''        case .walk, .run, .custom, .flight, .ship: return .walking
+                  case .cycle, .drive, .realisticDrive: return .automobile''',path)
+          s = change(s, '''    @Published var travelMode: TravelMode = .walk {
+                  didSet { UserDefaults.standard.set(travelMode.rawValue, forKey: "locus.travelMode") }
+              }''',
+          '''    @Published var travelMode: TravelMode = .walk {
+                  didSet {
+                      UserDefaults.standard.set(travelMode.rawValue, forKey: "locus.travelMode")
+                      travelDynamics.reset(route: routeSimulation.path)
+                  }
+              }''',path)
+          s = change(s, '''    private var variation = MotionVariation()
+              private var driftOffset''',
+          '''    private var variation = MotionVariation()
+              private var travelDynamics = TravelDynamics()
+              private var driftOffset''',path)
+          s = change(s, '''        routeSimulation.clear()
+                  stopJoystick()''',
+          '''        routeSimulation.clear()
+                  travelDynamics.reset()
+                  stopJoystick()''',path)
+          s = change(s, '''            routeSimulation = next
+                      lastMotionTime = ProcessInfo.processInfo.systemUptime''',
+          '''            routeSimulation = next
+                      travelDynamics.reset(route: next.path)
+                      lastMotionTime = ProcessInfo.processInfo.systemUptime''',path)
+          s = change(s, '''            candidate.advance(meters: baseSpeed * noise.multiplier * dt)
+                      next = candidate.position ?? next''',
+          '''            let distance = travelDynamics.advanceDistance(
+                          mode: travelMode,
+                          baseSpeed: baseSpeed,
+                          seconds: dt,
+                          travelled: candidate.travelledDistance,
+                          total: candidate.totalDistance,
+                          variation: noise.multiplier
+                      )
+                      candidate.advance(meters: distance)
+                      next = candidate.position ?? next''',path)
+          s = change(s, '''    private func cancelConnectionAttempt() {''',
+          '''    var travelStatusDescription: String {
+                  travelDynamics.status(mode: travelMode,
+                                        travelled: routeSimulation.travelledDistance,
+                                        total: routeSimulation.totalDistance)
+              }
+
+              /// For display only: Apple's developer-location service used here injects
+              /// coordinates, not actual speed/altitude sensor readings into Snapchat.
+              var estimatedFlightAltitude: Double { travelDynamics.estimatedFlightAltitude }
+
+              private func cancelConnectionAttempt() {''',path)
+
+          s += '''
+
+          /// Route-based speed simulation. Junction pauses are synthetic; this controller
+          /// does NOT know actual red/green light phases or live congestion.
+          /// The idevice location backend transmits coordinates only, so the altitude
+          /// below is a local estimate, not an altitude injected into other apps.
+          private struct TravelDynamics {
+              private var currentSpeed: Double = 0
+              private var junctionDistances: [Double] = []
+              private var nextJunction = 0
+              private var waitingSeconds: Double = 0
+              private(set) var estimatedFlightAltitude: Double = 0
+              private(set) var isWaiting = false
+
+              mutating func reset(route: [MotionPoint] = []) {
+                  currentSpeed = 0
+                  junctionDistances = Self.junctionCandidates(route)
+                  nextJunction = 0
+                  waitingSeconds = 0
+                  estimatedFlightAltitude = 0
+                  isWaiting = false
+              }
+
+              mutating func advanceDistance(mode: TravelMode, baseSpeed: Double, seconds: Double,
+                                            travelled: Double, total: Double, variation: Double) -> Double {
+                  // Avoid giant jumps following an iOS suspension/resume.
+                  let dt = min(1.0, max(0.0, seconds))
+                  guard dt > 0, total > 0 else { return 0 }
+                  let remaining = max(0, total - travelled)
+                  var target = max(0, baseSpeed * variation)
+                  var acceleration = 2.0
+                  var braking = 3.0
+
+                  if mode == .realisticDrive {
+                      acceleration = 1.7
+                      braking = 3.0
+                      if waitingSeconds > 0 {
+                          waitingSeconds = max(0, waitingSeconds - dt)
+                          currentSpeed = 0
+                          isWaiting = true
+                          if waitingSeconds == 0 { nextJunction += 1; isWaiting = false }
+                          return 0
+                      }
+                      if nextJunction < junctionDistances.count {
+                          let toJunction = max(0, junctionDistances[nextJunction] - travelled)
+                          if toJunction <= 1.5 {
+                              waitingSeconds = Double(12 + (nextJunction % 3) * 12)
+                              currentSpeed = 0
+                              isWaiting = true
+                              return 0
+                          }
+                          // Kinematic braking toward the next simulated junction hold.
+                          target = min(target, sqrt(2 * braking * toJunction))
+                      }
+                      // Slow naturally near the destination.
+                      target = min(target, sqrt(2 * braking * remaining))
+                  } else if mode == .flight {
+                      acceleration = 5.0
+                      braking = 4.0
+                      let takeoffLength = max(600, min(15000, total * 0.18))
+                      let arrivalLength = max(600, min(25000, total * 0.20))
+                      if travelled < min(500, takeoffLength / 4) {
+                          target = 8.0 // airport taxi
+                      } else if travelled < takeoffLength {
+                          target = max(35, target * min(1, travelled / takeoffLength))
+                      }
+                      if remaining < arrivalLength {
+                          target = min(target, max(12, baseSpeed * remaining / arrivalLength))
+                      }
+                      // Altitude changes over a much longer distance than takeoff acceleration.
+                      let climbLength = max(1000, min(160000, total * 0.30))
+                      let descentLength = max(1000, min(130000, total * 0.30))
+                      let climbRatio = min(1, max(0, (travelled - 500) / climbLength))
+                      let descentRatio = min(1, remaining / descentLength)
+                      estimatedFlightAltitude = 11000 * min(climbRatio, descentRatio)
+                  } else if mode == .ship {
+                      acceleration = 0.2
+                      braking = 0.3
+                      let portDistance = max(100, min(1500, total * 0.10))
+                      target = min(target, max(1.0, baseSpeed * min(1, travelled / portDistance + 0.12)))
+                      if remaining < portDistance {
+                          target = min(target, max(0.5, baseSpeed * remaining / portDistance))
+                      }
+                  } else {
+                      // Preserve normal Locus movement for walk, cycle, run, drive, custom.
+                      return min(remaining, target * dt)
+                  }
+
+                  let delta = target - currentSpeed
+                  currentSpeed += max(-braking * dt, min(acceleration * dt, delta))
+                  currentSpeed = max(0, currentSpeed)
+                  var move = min(remaining, currentSpeed * dt)
+                  if mode == .realisticDrive && nextJunction < junctionDistances.count {
+                      move = min(move, max(0, junctionDistances[nextJunction] - travelled))
+                  }
+                  return move
+              }
+
+              func status(mode: TravelMode, travelled: Double, total: Double) -> String {
+                  guard total > 0 else { return "" }
+                  let remaining = max(0, total - travelled)
+                  switch mode {
+                  case .flight:
+                      if travelled < min(15000, total * 0.18) { return String(localized: "Taxi / takeoff") }
+                      if remaining < min(25000, total * 0.20) { return String(localized: "Approach / landing") }
+                      return String(localized: "Cruising")
+                  case .ship:
+                      if remaining < min(1500, total * 0.10) { return String(localized: "Approaching port") }
+                      return String(localized: "At sea")
+                  case .realisticDrive:
+                      return isWaiting ? String(localized: "Simulated junction stop") : String(localized: "Traffic-style driving")
+                  default: return ""
+                  }
+              }
+
+              /// Approximate potential junctions from strong changes of road direction.
+              /// A turn is NOT evidence of a traffic signal; stops are illustrative only.
+              private static func junctionCandidates(_ path: [MotionPoint]) -> [Double] {
+                  guard path.count > 12 else { return [] }
+                  var accumulated = [Double](repeating: 0, count: path.count)
+                  for i in 1..<path.count {
+                      accumulated[i] = accumulated[i - 1] + path[i - 1].distance(to: path[i])
+                  }
+                  let length = accumulated.last ?? 0
+                  var candidates: [Double] = []
+                  for i in stride(from: 5, to: path.count - 5, by: 5) {
+                      let prev = path[i - 5], mid = path[i], next = path[i + 5]
+                      let latRad = mid.latitude * Double.pi / 180
+                      let headingIn = atan2((mid.longitude - prev.longitude) * cos(latRad), mid.latitude - prev.latitude)
+                      let headingOut = atan2((next.longitude - mid.longitude) * cos(latRad), next.latitude - mid.latitude)
+                      let angle = abs(atan2(sin(headingOut - headingIn), cos(headingOut - headingIn)))
+                      let at = accumulated[i]
+                      if angle > Double.pi / 3, at > 250, length - at > 250,
+                         at - (candidates.last ?? 0) > 300 {
+                          candidates.append(at)
+                      }
+                  }
+                  return candidates
+              }
+          }
+          '''
+          changes[path] = s
+
+          # ----- Speed controls: scrolling more modes + eliminate 300 km/h UI cap -----
+          path = Path('Locus/Support/SpeedControls.swift')
+          s = (ROOT / path).read_text()
+          old = '''            HStack(spacing: 4) {
+                          ForEach(TravelMode.allCases) { mode in
+                              let selected = session.travelMode == mode
+                              Button {
+                                  if mode == .custom {
+                                      showEditor = true
+                                  } else {
+                                      session.travelMode = mode
+                                  }
+                              } label: {
+                                  Image(systemName: mode.icon)
+                                      .font(.body.weight(.semibold))
+                                      .foregroundStyle(selected ? .black : .primary)
+                                      .frame(minWidth: 44, maxWidth: .infinity, minHeight: 44)
+                                      .background(Capsule().fill(selected ? LocusTheme.accent : Color.primary.opacity(0.08)))
+                                      .contentShape(Capsule())
+                              }
+                              .buttonStyle(.plain)
+                              .accessibilityLabel(mode.title)
+                              .accessibilityAddTraits(selected ? .isSelected : [])
+                          }
+                      }'''
+          new = '''            ScrollView(.horizontal, showsIndicators: false) {
+                          HStack(spacing: 6) {
+                              ForEach(TravelMode.allCases) { mode in
+                                  let selected = session.travelMode == mode
+                                  Button {
+                                      if mode == .custom {
+                                          showEditor = true
+                                      } else {
+                                          session.travelMode = mode
+                                      }
+                                  } label: {
+                                      Image(systemName: mode.icon)
+                                          .font(.body.weight(.semibold))
+                                          .foregroundStyle(selected ? .black : .primary)
+                                          .frame(width: 48, height: 44)
+                                          .background(Capsule().fill(selected ? LocusTheme.accent : Color.primary.opacity(0.08)))
+                                          .contentShape(Capsule())
+                                  }
+                                  .buttonStyle(.plain)
+                                  .accessibilityLabel(mode.title)
+                                  .accessibilityAddTraits(selected ? .isSelected : [])
+                              }
+                          }
+                      }'''
+          s = change(s, old, new, path)
+          s = change(s, 'range: 0.1...300, step: 0.1,', 'range: 0.1...2000, step: 0.1,', path)
+          changes[path] = s
+
+          # ----- Routes UI: direct waypoint route for ships/planes; no imaginary MapKit sea route -----
+          path = Path('Locus/Features/Routes/RoutePlannerSheet.swift')
+          s = (ROOT / path).read_text()
+          s = change(s, '''                        Button(action: onBuild) {
+                                      Label(String(localized: "Build connected route"), systemImage: "road.lanes")
+                                  }''',
+          '''                        Button(action: onBuild) {
+                                      if session.travelMode == .flight || session.travelMode == .ship {
+                                          Label(String(localized: "Build direct waypoint route"), systemImage: "point.topleft.down.to.point.bottomright.curvepath")
+                                      } else {
+                                          Label(String(localized: "Build connected route"), systemImage: "road.lanes")
+                                      }
+                                  }''', path)
+          s = change(s, '''                } footer: {
+                              Text(String(localized: "Editing stops or the road type requires rebuilding. Your current running or paused route is kept until you stop it."))
+                          }''',
+          '''                } footer: {
+                              if session.travelMode == .flight || session.travelMode == .ship {
+                                  Text(String(localized: "Flight and ship routes join waypoints directly. Add intermediate waypoints; a straight ship route might cross land. This is a simulation, not a navigation service."))
+                              } else if session.travelMode == .realisticDrive {
+                                  Text(String(localized: "Driving follows Apple Maps roads, with simulated stops near some sharp junction turns. These are not actual traffic-light states or live traffic reports."))
+                              } else {
+                                  Text(String(localized: "Editing stops or the road type requires rebuilding. Your current running or paused route is kept until you stop it."))
+                              }
+                          }''', path)
+          s = change(s, '''                    Text(session.routeSimulation.progress.formatted(.percent.precision(.fractionLength(0))))
+                                  .font(.caption.monospacedDigit())
+                                  .foregroundStyle(.secondary)''',
+          '''                    Text(session.routeSimulation.progress.formatted(.percent.precision(.fractionLength(0))))
+                                  .font(.caption.monospacedDigit())
+                                  .foregroundStyle(.secondary)
+                              if !session.travelStatusDescription.isEmpty {
+                                  Text(session.travelStatusDescription)
+                                      .font(.caption)
+                                      .foregroundStyle(.secondary)
+                              }
+                              if session.travelMode == .flight {
+                                  Text(String(format: String(localized: "Estimated altitude: %.0f m (display only)"),
+                                              session.estimatedFlightAltitude))
+                                      .font(.caption.monospacedDigit())
+                                      .foregroundStyle(.secondary)
+                              }''',path)
+          changes[path] = s
+
+          # ----- Map route planner: draw open-water and air waypoints as direct lines -----
+          path = Path('Locus/Features/Map/MapHomeView.swift')
+          s = (ROOT / path).read_text()
+          s = change(s, '''        cancelRoadBuild()
+                  let requestID = routeBuildID
+                  let transportType = session.roadTransportType''',
+          '''        cancelRoadBuild()
+                  if session.travelMode == .flight || session.travelMode == .ship {
+                      let spacing = session.travelMode == .flight ? 5000.0 : 500.0
+                      // No MapKit airplane/boat routing API: explicitly connect user waypoints.
+                      var legs: [[MotionPoint]] = []
+                      for (start, end) in zip(points, points.dropFirst()) {
+                          let distance = start.distance(to: end)
+                          let count = max(1, Int(ceil(distance / spacing)))
+                          legs.append((0...count).map { step in
+                              start.interpolated(to: end, fraction: Double(step) / Double(count))
+                          })
+                      }
+                      setPreparedRoute(RouteGeometry.joined(legs).map(\\.coordinate), isRoad: false)
+                      return
+                  }
+                  let requestID = routeBuildID
+                  let transportType = session.roadTransportType''', path)
+          s = change(s, '''        .onChange(of: session.roadTransportType.rawValue) { _, _ in''',
+          '''        .onChange(of: session.travelMode) { _, _ in
+                      if routeIsRoadRoute || isRouting {
+                          cancelRoadBuild()
+                          routeCoords.removeAll()
+                          preparedDistance = 0
+                      }
+                  }
+                  .onChange(of: session.roadTransportType.rawValue) { _, _ in''', path)
+          changes[path] = s
+
+          # ----- Localization: add both supported languages -----
+          strings = {
+              'Traffic drive': '交通驾驶',
+              'Airplane': '飞机',
+              'Ship': '船舶',
+              'Taxi / takeoff': '滑行 / 起飞',
+              'Approach / landing': '进近 / 降落',
+              'Cruising': '巡航',
+              'Approaching port': '靠近港口',
+              'At sea': '海上航行',
+              'Simulated junction stop': '模拟路口停车',
+              'Traffic-style driving': '模拟交通驾驶',
+              'Build direct waypoint route': '建立航点直线路线',
+              'Flight and ship routes join waypoints directly. Add intermediate waypoints; a straight ship route might cross land. This is a simulation, not a navigation service.': '飞机和船舶路线以直线连接航点。请添加中间航点；船舶直线路线可能穿过陆地。这是模拟功能，并非导航服务。',
+              'Driving follows Apple Maps roads, with simulated stops near some sharp junction turns. These are not actual traffic-light states or live traffic reports.': '驾驶路线沿 Apple 地图道路行驶，并在部分急转弯路口附近模拟停车。这些不代表真实红绿灯状态或实时路况。',
+              'Estimated altitude: %.0f m (display only)': '估计高度：%.0f 米（仅用于显示）',
+          }
+          for lang in ['en', 'zh-Hans']:
+              path = Path(f'Locus/Resources/{lang}.lproj/Localizable.strings')
+              original = (ROOT / path).read_text()
+              suffix = '\n// Travel simulation profiles (estimated movement; not live traffic)\n'
+              for english, chinese in strings.items():
+                  if f'"{english}" =' not in original:
+                      suffix += f'"{english}" = "{english if lang == "en" else chinese}";\n'
+              changes[path] = original.rstrip() + '\n' + suffix
+
+          # Commit all changes only after every expected source pattern has matched.
+          for target, data in changes.items():
+              (ROOT / target).write_text(data)
+              print('Updated', target)
+          print('Upgrade ready. Review with git diff, then build using the existing workflow.')
+          PY
+          python3 upgrade_locus_travel_modes.py
+      - name: Create a review branch containing the changes
+        env:
+          RUN_ID: ${{ github.run_id }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          BRANCH="feature/travel-modes-${RUN_ID}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$BRANCH"
+          git add Locus/Engine/SpoofSession.swift Locus/Support/SpeedControls.swift \
+            Locus/Features/Routes/RoutePlannerSheet.swift Locus/Features/Map/MapHomeView.swift \
+            Locus/Resources/en.lproj/Localizable.strings Locus/Resources/zh-Hans.lproj/Localizable.strings
+          git diff --cached --check
+          git commit -m "Add flight, ship and simulated traffic-drive profiles"
+          git push origin "$BRANCH"
+          echo "### Review these changes before merging" >> "$GITHUB_STEP_SUMMARY"
+          echo "https://github.com/${REPOSITORY}/compare/main...${BRANCH}?expand=1" >> "$GITHUB_STEP_SUMMARY"
