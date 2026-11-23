@@ -1,0 +1,23 @@
+# Codemagic build for og69lc-lab/locus, feature/travel-modes-45172154432.
+# Upload this file to the REPOSITORY ROOT on that branch (not main).
+workflows:
+  locus-travel-modes-unsigned:
+    name: Locus Travel Modes - Unsigned IPA
+    instance_type: mac_mini_m2
+    max_build_duration: 60
+    environment:
+      xcode: latest
+    scripts:
+      - name: Install XcodeGen if necessary
+        script: |
+          if ! command -v xcodegen >/dev/null 2>&1; then
+            brew install xcodegen
+          fi
+      - name: Build and validate unsigned iPhone IPA
+        script: |
+          bash scripts/build-unsigned-ipa.sh
+    artifacts:
+      - outputs/*.ipa
+      - outputs/*.log
+      - outputs/*.txt
+      - outputs/SHA256SUMS
