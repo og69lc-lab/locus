@@ -137,10 +137,51 @@ final class SpoofSession: ObservableObject {
     private var joystickVector: CGVector = .zero
     private let locationKeeper = BackgroundKeepAlive()
 
+    @Published private(set) var journeyPlan: JourneyPlan?
+    @Published private(set) var journeyEnabled = false
+    @Published private(set) var journeyPaused = false
+    @Published private(set) var journeyActivity = ""
+    private var journeySchedule: JourneySchedule?
+
+    func importJourney(_ data: Data) throws {
+        guard !journeyEnabled else { throw JourneyError.invalid("Stop the current journey first.") }
+        let plan = try JourneyPlan.decode(data)
+        UserDefaults.standard.set(data,forKey:JourneyPlan.storageKey)
+        journeyPlan = plan; journeyActivity = "Ready"
+    }
+    func startJourney(pairing: PairingStore) {
+        guard let plan = journeyPlan, let schedule = try? JourneySchedule(plan) else { return }
+        guard pairing.hasPairingFile else { lastError = "Import an RPPairing file first."; return }
+        guard !schedule.frame(at:Date()).finished else { lastError = "Journey ended. Import a plan with new dates."; return }
+        cancelMovement()
+        journeySchedule = schedule; journeyEnabled = true; journeyPaused = false
+        driftOffset = (0,0); variation = MotionVariation()
+        journeyActivity = "Connecting…"
+        startAfterResolving { [self] in
+            guard journeyEnabled else { return }
+            let frame = schedule.frame(at:Date())
+            if frame.finished { clearJourneyMovement(); journeyActivity = "Journey complete"; return }
+            apply(CLLocationCoordinate2D(latitude:frame.point.latitude,longitude:frame.point.longitude),pairing:pairing,markRecent:false)
+            journeyActivity = status == .active ? frame.label : "Connection failed — resume to retry"
+        }
+    }
+    func pauseJourney() {
+        guard journeyEnabled, status == .active else { return }
+        journeyPaused = true; journeyActivity = "Paused — clock continues"
+    }
+    func resumeJourney(pairing: PairingStore) {
+        if journeyEnabled && status == .active { journeyPaused = false; journeyActivity = "Resuming…" }
+        else { startJourney(pairing:pairing) }
+    }
+    private func clearJourneyMovement() {
+        journeySchedule = nil; journeyEnabled = false; journeyPaused = false; journeyActivity = ""
+    }
+
     private let favoritesKey = "locus.favorites"
     private let recentsKey = "locus.recents"
 
     init() {
+        if let data = UserDefaults.standard.data(forKey: JourneyPlan.storageKey) { journeyPlan = try? JourneyPlan.decode(data) }
         favorites = SavedPlace.load(key: favoritesKey)
         recents = SavedPlace.load(key: recentsKey)
         travelMode = TravelMode(rawValue: UserDefaults.standard.string(forKey: "locus.travelMode") ?? "") ?? .walk
@@ -236,6 +277,7 @@ final class SpoofSession: ObservableObject {
     }
 
     private func cancelMovement() {
+        clearJourneyMovement()
         stopFreeLiveFlight()
         cancelConnectionAttempt()
         routeSimulation.clear()
@@ -510,6 +552,22 @@ final class SpoofSession: ObservableObject {
         let dt = max(0, now - lastMotionTime)
         lastMotionTime = now
         guard status == .active, let ideal = idealCoordinate else { return }
+        if journeyEnabled, let schedule = journeySchedule {
+            guard !journeyPaused else { return }
+            let frame = schedule.frame(at:Date())
+            if frame.finished {
+                stop(pairing:pairing)
+                journeyActivity = "Journey complete — simulation stopped"
+                return
+            }
+            if journeyActivity != frame.label { journeyActivity = frame.label }
+            driftOffset = (0,0)
+            let current = JourneyPoint(latitude:ideal.latitude,longitude:ideal.longitude)
+            if current.distance(to:frame.point) > 0.2 {
+                apply(CLLocationCoordinate2D(latitude:frame.point.latitude,longitude:frame.point.longitude),pairing:pairing,markRecent:false)
+            }
+            return
+        }
         let noise = variation.update(seconds: dt, settings: motionSettings)
         let oldOffset = driftOffset
         driftOffset = (noise.east, noise.north)
@@ -888,5 +946,116 @@ private struct TravelDynamics {
             }
         }
         return candidates
+    }
+}
+
+// MARK: - Journey Autopilot (local scheduled simulation)
+struct JourneyPoint: Codable {
+    let latitude: Double
+    let longitude: Double
+    var valid: Bool { latitude.isFinite && longitude.isFinite && abs(latitude) <= 90 && abs(longitude) <= 180 }
+    func distance(to b: Self) -> Double {
+        let a1 = latitude * .pi / 180, b1 = b.latitude * .pi / 180
+        let d = (b.longitude - longitude) * .pi / 180
+        let h = pow(sin((b1-a1)/2),2) + cos(a1)*cos(b1)*pow(sin(d/2),2)
+        return 6371000 * 2 * asin(sqrt(min(1,max(0,h))))
+    }
+    func interpolate(to b: Self, fraction f: Double) -> Self {
+        if f <= 0 { return self }; if f >= 1 { return b }
+        let a1 = latitude * .pi / 180, b1 = b.latitude * .pi / 180
+        let d = (b.longitude - longitude) * .pi / 180
+        let bearing = atan2(sin(d)*cos(b1),cos(a1)*sin(b1)-sin(a1)*cos(b1)*cos(d))
+        let angle = distance(to:b) * f / 6371000
+        let lat = asin(min(1,max(-1,sin(a1)*cos(angle)+cos(a1)*sin(angle)*cos(bearing))))
+        let lon = longitude * .pi / 180 + atan2(sin(bearing)*sin(angle)*cos(a1),cos(angle)-sin(a1)*sin(lat))
+        return Self(latitude:lat*180 / .pi,longitude:(lon*180 / .pi+540).truncatingRemainder(dividingBy:360)-180)
+    }
+}
+struct JourneyLeg: Codable, Identifiable {
+    let title: String
+    let mode: String
+    let start: Date
+    let end: Date
+    let timeZone: String?
+    let notes: String?
+    let points: [JourneyPoint]
+    var id: Date { start }
+    var zone: TimeZone { timeZone.flatMap { TimeZone(identifier:$0) } ?? .current }
+}
+enum JourneyError: LocalizedError {
+    case invalid(String)
+    var errorDescription: String? { switch self { case .invalid(let message): return message } }
+}
+struct JourneyPlan: Codable {
+    let version: Int
+    let title: String
+    let legs: [JourneyLeg]
+    static let storageKey = "locus.journey.plan.v1"
+    static let maxBytes = 2_000_000
+    static func decode(_ data: Data) throws -> Self {
+        guard data.count <= maxBytes else { throw JourneyError.invalid("File exceeds 2 MB.") }
+        let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .iso8601
+        let plan = try decoder.decode(Self.self,from:data); try plan.validate(); return plan
+    }
+    func validate() throws {
+        guard version == 1, !title.isEmpty, let first = legs.first, let last = legs.last,
+              legs.count <= 10000, last.end.timeIntervalSince(first.start) <= 366*86400 else {
+            throw JourneyError.invalid("Expected version 1 and 1–10,000 activities spanning no more than 366 days.")
+        }
+        let modes = Set(["stay","walk","run","cycle","drive","flight","ship","train"])
+        var prev: JourneyLeg?; var count = 0
+        for leg in legs {
+            count += leg.points.count
+            guard count <= 100000, !leg.title.isEmpty, modes.contains(leg.mode), leg.end > leg.start,
+                  leg.points.allSatisfy(\.valid), (leg.mode == "stay" ? leg.points.count == 1 : leg.points.count >= 2),
+                  leg.timeZone == nil || TimeZone(identifier:leg.timeZone!) != nil else {
+                throw JourneyError.invalid("Invalid activity: \(leg.title)")
+            }
+            if let prev {
+                guard leg.start == prev.end, prev.points.last!.distance(to:leg.points.first!) <= 1 else {
+                    throw JourneyError.invalid("Gap, overlap or disconnected coordinates before \(leg.title).")
+                }
+            }
+            prev = leg
+        }
+    }
+}
+struct JourneyTrack {
+    let points: [JourneyPoint]
+    let cumulative: [Double]
+    init(_ leg: JourneyLeg) {
+        points = leg.points
+        var c = [0.0]
+        for i in leg.points.indices.dropFirst() { c.append(c[i-1] + leg.points[i-1].distance(to:leg.points[i])) }
+        cumulative = c
+    }
+    func sample(_ f: Double) -> JourneyPoint {
+        guard points.count > 1, let total = cumulative.last, total > 0 else { return points[0] }
+        if f <= 0 { return points[0] }; if f >= 1 { return points[points.count-1] }
+        let target = total*f
+        var lo = 1, hi = points.count-1
+        while lo < hi { let m = (lo+hi)/2; if cumulative[m] < target { lo = m+1 } else { hi = m } }
+        let length = cumulative[lo]-cumulative[lo-1]
+        guard length > 0 else { return points[lo] }
+        return points[lo-1].interpolate(to:points[lo],fraction:(target-cumulative[lo-1])/length)
+    }
+}
+struct JourneyFrame {
+    let point: JourneyPoint
+    let label: String
+    let finished: Bool
+}
+struct JourneySchedule {
+    let plan: JourneyPlan
+    private let tracks: [JourneyTrack]
+    init(_ plan: JourneyPlan) throws { try plan.validate(); self.plan = plan; tracks = plan.legs.map(JourneyTrack.init) }
+    func frame(at date: Date) -> JourneyFrame {
+        let legs = plan.legs, last = plan.legs.count-1
+        if date < legs[0].start { return JourneyFrame(point:tracks[0].sample(0),label:"Waiting for start",finished:false) }
+        if date >= legs[last].end { return JourneyFrame(point:tracks[last].sample(1),label:"Journey complete",finished:true) }
+        var lo = 0, hi = last
+        while lo < hi { let m = (lo+hi)/2; if legs[m].end <= date { lo = m+1 } else { hi = m } }
+        let leg = legs[lo]
+        return JourneyFrame(point:tracks[lo].sample(date.timeIntervalSince(leg.start)/leg.end.timeIntervalSince(leg.start)),label:leg.title,finished:false)
     }
 }

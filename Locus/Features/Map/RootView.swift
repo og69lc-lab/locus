@@ -1,10 +1,13 @@
 import SwiftUI
+import UniformTypeIdentifiers
+import UIKit
 
 struct RootView: View {
     @EnvironmentObject private var session: SpoofSession
     @EnvironmentObject private var pairing: PairingStore
     @State private var showSettings = false
     @State private var showPlaces = false
+    @State private var showJourney = false
 
     var body: some View {
         // Bottom chrome is a sibling overlay aligned to the bottom — no full-screen
@@ -14,7 +17,8 @@ struct RootView: View {
 
             BottomControlsView(
                 showSettings: $showSettings,
-                showPlaces: $showPlaces
+                showPlaces: $showPlaces,
+                showJourney: $showJourney
             )
             .padding(.horizontal, 16)
             .padding(.bottom, 8)
@@ -22,6 +26,7 @@ struct RootView: View {
         .sheet(isPresented: $showSettings) {
             SettingsView()
         }
+        .sheet(isPresented: $showJourney) { JourneyAutopilotView() }
         .sheet(isPresented: $showPlaces) {
             PlacesView()
         }
@@ -139,6 +144,7 @@ struct BottomControlsView: View {
     @EnvironmentObject private var pairing: PairingStore
     @Binding var showSettings: Bool
     @Binding var showPlaces: Bool
+    @Binding var showJourney: Bool
 
     private let trayShape = RoundedRectangle(cornerRadius: 28, style: .continuous)
 
@@ -156,6 +162,15 @@ struct BottomControlsView: View {
                 RoutePlaybackControls()
             }
 
+            Button { showJourney = true } label: {
+                HStack {
+                    Image(systemName: "calendar.badge.clock")
+                    Text(session.journeyEnabled ? session.journeyActivity : "Journey Autopilot").lineLimit(1)
+                    Spacer()
+                    Image(systemName: "chevron.right")
+                }.font(.subheadline.weight(.semibold)).padding(10)
+                .background(Color.primary.opacity(0.08), in: RoundedRectangle(cornerRadius:12))
+            }.buttonStyle(.plain)
             SpeedControls()
 
             HStack(spacing: 10) {
@@ -258,5 +273,76 @@ struct IconButton: View {
         .buttonStyle(.plain)
         .locusGlass(.interactive, in: Circle())
         .foregroundStyle(.primary)
+    }
+}
+
+struct JourneyAutopilotView: View {
+    @EnvironmentObject private var session: SpoofSession
+    @EnvironmentObject private var pairing: PairingStore
+    @Environment(\.dismiss) private var dismiss
+    @State private var importing = false
+    @State private var error: String?
+    var body: some View {
+        NavigationStack {
+            List {
+                Section("Import") {
+                    Text("Scheduled GPS simulation. Import a planned itinerary, not an observed travel record.").font(.footnote).foregroundStyle(.secondary)
+                    Button("Import Journey JSON") { importing = true }.disabled(session.journeyEnabled)
+                    Button("Paste Journey JSON") {
+                        guard let text = UIPasteboard.general.string else { error = "Clipboard is empty."; return }
+                        load(Data(text.utf8))
+                    }.disabled(session.journeyEnabled)
+                }
+                if let plan = session.journeyPlan {
+                    Section("Journey") {
+                        Text(plan.title).font(.headline)
+                        Text("\(plan.legs.count) activities · \(session.status.label)")
+                        Text(session.journeyActivity.isEmpty ? "Ready" : session.journeyActivity).foregroundStyle(.secondary)
+                        if session.journeyEnabled {
+                            if session.journeyPaused || session.status != .active {
+                                Button("Resume at scheduled time") { session.resumeJourney(pairing:pairing) }.disabled(session.isBusy)
+                            } else {
+                                Button("Pause") { session.pauseJourney() }
+                            }
+                            Button("Stop and restore real GPS",role:.destructive) { session.stop(pairing:pairing) }
+                        } else {
+                            Button("Start / resume journey") { session.startJourney(pairing:pairing) }.disabled(session.isBusy)
+                        }
+                    }
+                    Section("Itinerary") {
+                        ForEach(plan.legs) { leg in
+                            VStack(alignment:.leading,spacing:4) {
+                                Text(leg.title).font(.headline)
+                                Text("\(leg.mode.capitalized) · \(format(leg.start,leg.zone)) – \(format(leg.end,leg.zone))").font(.caption).foregroundStyle(.secondary)
+                                if let notes = leg.notes { Text(notes).font(.caption).foregroundStyle(.secondary) }
+                            }
+                        }
+                    }
+                }
+                Section("Background & safety") {
+                    Text("The clock continues while paused. When resumed, missed movement may be skipped. Keep the developer tunnel connected. iOS can suspend the app; after force quit, reopen and tap Start / resume. At completion the app attempts to restore real GPS. Never use simulated coordinates for navigation, emergencies or proof of travel.").font(.footnote).foregroundStyle(.secondary)
+                }
+            }
+            .navigationTitle("Journey Autopilot")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement:.confirmationAction) { Button("Done") { dismiss() } } }
+            .fileImporter(isPresented:$importing,allowedContentTypes:[.json],allowsMultipleSelection:false) { result in
+                do {
+                    guard let url = try result.get().first else { return }
+                    let access = url.startAccessingSecurityScopedResource()
+                    defer { if access { url.stopAccessingSecurityScopedResource() } }
+                    let size = try url.resourceValues(forKeys:[.fileSizeKey]).fileSize ?? 0
+                    guard size <= JourneyPlan.maxBytes else { throw JourneyError.invalid("File exceeds 2 MB.") }
+                    load(try Data(contentsOf:url))
+                } catch { self.error = error.localizedDescription }
+            }
+            .alert("Journey Autopilot",isPresented:Binding(get:{error != nil},set:{if !$0 {error = nil}})) {
+                Button("OK",role:.cancel) {error = nil}
+            } message: { Text(error ?? "") }
+        }
+    }
+    private func load(_ data:Data) { do {try session.importJourney(data)} catch {self.error = error.localizedDescription} }
+    private func format(_ date:Date,_ zone:TimeZone) -> String {
+        let f = DateFormatter(); f.timeZone = zone; f.dateFormat = "MMM d, HH:mm z"; return f.string(from:date)
     }
 }

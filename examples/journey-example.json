@@ -1,0 +1,49 @@
+{
+  "version": 1,
+  "title": "Fictional test itinerary \u2014 replace dates and coordinates",
+  "legs": [
+    {
+      "title": "Breakfast",
+      "mode": "stay",
+      "start": "2027-01-01T07:00:00Z",
+      "end": "2027-01-01T07:30:00Z",
+      "timeZone": "Etc/UTC",
+      "points": [
+        {
+          "latitude": 0,
+          "longitude": 0
+        }
+      ]
+    },
+    {
+      "title": "Test walk",
+      "mode": "walk",
+      "start": "2027-01-01T07:30:00Z",
+      "end": "2027-01-01T07:45:00Z",
+      "timeZone": "Etc/UTC",
+      "points": [
+        {
+          "latitude": 0,
+          "longitude": 0
+        },
+        {
+          "latitude": 0.005,
+          "longitude": 0
+        }
+      ]
+    },
+    {
+      "title": "Rest",
+      "mode": "stay",
+      "start": "2027-01-01T07:45:00Z",
+      "end": "2027-01-01T08:00:00Z",
+      "timeZone": "Etc/UTC",
+      "points": [
+        {
+          "latitude": 0.005,
+          "longitude": 0
+        }
+      ]
+    }
+  ]
+}
