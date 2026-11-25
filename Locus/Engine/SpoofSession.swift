@@ -5,7 +5,7 @@ import UIKit
 import UserNotifications
 
 enum TravelMode: String, CaseIterable, Identifiable {
-    case walk, run, cycle, drive, custom
+    case walk, run, cycle, drive, realisticDrive, flight, ship, custom
 
     var id: String { rawValue }
 
@@ -15,6 +15,9 @@ enum TravelMode: String, CaseIterable, Identifiable {
         case .run: return String(localized: "Run")
         case .cycle: return String(localized: "Cycle")
         case .drive: return String(localized: "Drive")
+        case .realisticDrive: return String(localized: "Traffic drive")
+        case .flight: return String(localized: "Airplane")
+        case .ship: return String(localized: "Ship")
         case .custom: return String(localized: "Custom")
         }
     }
@@ -25,6 +28,9 @@ enum TravelMode: String, CaseIterable, Identifiable {
         case .run: return "figure.run"
         case .cycle: return "bicycle"
         case .drive: return "car.fill"
+        case .realisticDrive: return "car.side.fill"
+        case .flight: return "airplane"
+        case .ship: return "ferry.fill"
         case .custom: return "speedometer"
         }
     }
@@ -35,15 +41,17 @@ enum TravelMode: String, CaseIterable, Identifiable {
         case .walk: return 1.4
         case .run: return 3.3
         case .cycle: return 6.5
-        case .drive: return 13.4
+        case .drive, .realisticDrive: return 13.4
+        case .flight: return 235.0  // 846 km/h cruise; profile handles departure and arrival
+        case .ship: return 9.0     // 32.4 km/h cruise; profile handles ports
         case .custom: return 5.0 / 3.6
         }
     }
 
     var mkTransportType: MKDirectionsTransportType {
         switch self {
-        case .walk, .run, .custom: return .walking
-        case .cycle, .drive: return .automobile
+        case .walk, .run, .custom, .flight, .ship: return .walking
+        case .cycle, .drive, .realisticDrive: return .automobile
         }
     }
 }
@@ -77,7 +85,10 @@ final class SpoofSession: ObservableObject {
     @Published var pin: CLLocationCoordinate2D?
     @Published var simulated: CLLocationCoordinate2D?
     @Published var travelMode: TravelMode = .walk {
-        didSet { UserDefaults.standard.set(travelMode.rawValue, forKey: "locus.travelMode") }
+        didSet {
+            UserDefaults.standard.set(travelMode.rawValue, forKey: "locus.travelMode")
+            travelDynamics.reset(route: routeSimulation.path)
+        }
     }
     @Published var motionSettings = MotionSettings.load() {
         didSet { motionSettings.save() }
@@ -107,6 +118,7 @@ final class SpoofSession: ObservableObject {
     private var motionTimer: Timer?
     @Published private(set) var routeSimulation = RouteSimulation()
     private var variation = MotionVariation()
+    private var travelDynamics = TravelDynamics()
     private var driftOffset = (east: 0.0, north: 0.0)
     private var lastMotionTime = ProcessInfo.processInfo.systemUptime
     private var generation = UUID()
@@ -215,6 +227,7 @@ final class SpoofSession: ObservableObject {
     private func cancelMovement() {
         cancelConnectionAttempt()
         routeSimulation.clear()
+        travelDynamics.reset()
         stopJoystick()
     }
 
@@ -230,9 +243,20 @@ final class SpoofSession: ObservableObject {
             apply(coordinates[0], pairing: pairing, markRecent: true)
             guard status == .active else { return }
             routeSimulation = next
+            travelDynamics.reset(route: next.path)
             lastMotionTime = ProcessInfo.processInfo.systemUptime
         }
     }
+
+    var travelStatusDescription: String {
+        travelDynamics.status(mode: travelMode,
+                              travelled: routeSimulation.travelledDistance,
+                              total: routeSimulation.totalDistance)
+    }
+
+    /// For display only: Apple's developer-location service used here injects
+    /// coordinates, not actual speed/altitude sensor readings into Snapchat.
+    var estimatedFlightAltitude: Double { travelDynamics.estimatedFlightAltitude }
 
     private func cancelConnectionAttempt() {
         connectionRequestID = UUID()
@@ -420,7 +444,15 @@ final class SpoofSession: ObservableObject {
         var advancedRoute: RouteSimulation?
         if routeSimulation.phase == .running {
             var candidate = routeSimulation
-            candidate.advance(meters: baseSpeed * noise.multiplier * dt)
+            let distance = travelDynamics.advanceDistance(
+                mode: travelMode,
+                baseSpeed: baseSpeed,
+                seconds: dt,
+                travelled: candidate.travelledDistance,
+                total: candidate.totalDistance,
+                variation: noise.multiplier
+            )
+            candidate.advance(meters: distance)
             next = candidate.position ?? next
             advancedRoute = candidate
             moved = true
@@ -558,5 +590,145 @@ extension MotionPoint {
 
     var coordinate: CLLocationCoordinate2D {
         CLLocationCoordinate2D(latitude: latitude, longitude: longitude)
+    }
+}
+
+
+/// Route-based speed simulation. Junction pauses are synthetic; this controller
+/// does NOT know actual red/green light phases or live congestion.
+/// The idevice location backend transmits coordinates only, so the altitude
+/// below is a local estimate, not an altitude injected into other apps.
+private struct TravelDynamics {
+    private var currentSpeed: Double = 0
+    private var junctionDistances: [Double] = []
+    private var nextJunction = 0
+    private var waitingSeconds: Double = 0
+    private(set) var estimatedFlightAltitude: Double = 0
+    private(set) var isWaiting = false
+
+    mutating func reset(route: [MotionPoint] = []) {
+        currentSpeed = 0
+        junctionDistances = Self.junctionCandidates(route)
+        nextJunction = 0
+        waitingSeconds = 0
+        estimatedFlightAltitude = 0
+        isWaiting = false
+    }
+
+    mutating func advanceDistance(mode: TravelMode, baseSpeed: Double, seconds: Double,
+                                  travelled: Double, total: Double, variation: Double) -> Double {
+        // Avoid giant jumps following an iOS suspension/resume.
+        let dt = min(1.0, max(0.0, seconds))
+        guard dt > 0, total > 0 else { return 0 }
+        let remaining = max(0, total - travelled)
+        var target = max(0, baseSpeed * variation)
+        var acceleration = 2.0
+        var braking = 3.0
+
+        if mode == .realisticDrive {
+            acceleration = 1.7
+            braking = 3.0
+            if waitingSeconds > 0 {
+                waitingSeconds = max(0, waitingSeconds - dt)
+                currentSpeed = 0
+                isWaiting = true
+                if waitingSeconds == 0 { nextJunction += 1; isWaiting = false }
+                return 0
+            }
+            if nextJunction < junctionDistances.count {
+                let toJunction = max(0, junctionDistances[nextJunction] - travelled)
+                if toJunction <= 1.5 {
+                    waitingSeconds = Double(12 + (nextJunction % 3) * 12)
+                    currentSpeed = 0
+                    isWaiting = true
+                    return 0
+                }
+                // Kinematic braking toward the next simulated junction hold.
+                target = min(target, sqrt(2 * braking * toJunction))
+            }
+            // Slow naturally near the destination.
+            target = min(target, sqrt(2 * braking * remaining))
+        } else if mode == .flight {
+            acceleration = 5.0
+            braking = 4.0
+            let takeoffLength = max(600, min(15000, total * 0.18))
+            let arrivalLength = max(600, min(25000, total * 0.20))
+            if travelled < min(500, takeoffLength / 4) {
+                target = 8.0 // airport taxi
+            } else if travelled < takeoffLength {
+                target = max(35, target * min(1, travelled / takeoffLength))
+            }
+            if remaining < arrivalLength {
+                target = min(target, max(12, baseSpeed * remaining / arrivalLength))
+            }
+            // Altitude changes over a much longer distance than takeoff acceleration.
+            let climbLength = max(1000, min(160000, total * 0.30))
+            let descentLength = max(1000, min(130000, total * 0.30))
+            let climbRatio = min(1, max(0, (travelled - 500) / climbLength))
+            let descentRatio = min(1, remaining / descentLength)
+            estimatedFlightAltitude = 11000 * min(climbRatio, descentRatio)
+        } else if mode == .ship {
+            acceleration = 0.2
+            braking = 0.3
+            let portDistance = max(100, min(1500, total * 0.10))
+            target = min(target, max(1.0, baseSpeed * min(1, travelled / portDistance + 0.12)))
+            if remaining < portDistance {
+                target = min(target, max(0.5, baseSpeed * remaining / portDistance))
+            }
+        } else {
+            // Preserve normal Locus movement for walk, cycle, run, drive, custom.
+            return min(remaining, target * dt)
+        }
+
+        let delta = target - currentSpeed
+        currentSpeed += max(-braking * dt, min(acceleration * dt, delta))
+        currentSpeed = max(0, currentSpeed)
+        var move = min(remaining, currentSpeed * dt)
+        if mode == .realisticDrive && nextJunction < junctionDistances.count {
+            move = min(move, max(0, junctionDistances[nextJunction] - travelled))
+        }
+        return move
+    }
+
+    func status(mode: TravelMode, travelled: Double, total: Double) -> String {
+        guard total > 0 else { return "" }
+        let remaining = max(0, total - travelled)
+        switch mode {
+        case .flight:
+            if travelled < min(15000, total * 0.18) { return String(localized: "Taxi / takeoff") }
+            if remaining < min(25000, total * 0.20) { return String(localized: "Approach / landing") }
+            return String(localized: "Cruising")
+        case .ship:
+            if remaining < min(1500, total * 0.10) { return String(localized: "Approaching port") }
+            return String(localized: "At sea")
+        case .realisticDrive:
+            return isWaiting ? String(localized: "Simulated junction stop") : String(localized: "Traffic-style driving")
+        default: return ""
+        }
+    }
+
+    /// Approximate potential junctions from strong changes of road direction.
+    /// A turn is NOT evidence of a traffic signal; stops are illustrative only.
+    private static func junctionCandidates(_ path: [MotionPoint]) -> [Double] {
+        guard path.count > 12 else { return [] }
+        var accumulated = [Double](repeating: 0, count: path.count)
+        for i in 1..<path.count {
+            accumulated[i] = accumulated[i - 1] + path[i - 1].distance(to: path[i])
+        }
+        let length = accumulated.last ?? 0
+        var candidates: [Double] = []
+        for i in stride(from: 5, to: path.count - 5, by: 5) {
+            let prev = path[i - 5], mid = path[i], next = path[i + 5]
+            let latRad = mid.latitude * Double.pi / 180
+            let headingIn = atan2((mid.longitude - prev.longitude) * cos(latRad), mid.latitude - prev.latitude)
+            let headingOut = atan2((next.longitude - mid.longitude) * cos(latRad), next.latitude - mid.latitude)
+            let angle = abs(atan2(sin(headingOut - headingIn), cos(headingOut - headingIn)))
+            let at = accumulated[i]
+            if angle > Double.pi / 3, at > 250, length - at > 250,
+               at - (candidates.last ?? 0) > 300 {
+                candidates.append(at)
+            }
+        }
+        return candidates
     }
 }

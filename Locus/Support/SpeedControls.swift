@@ -7,26 +7,28 @@ struct SpeedControls: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 4) {
-                ForEach(TravelMode.allCases) { mode in
-                    let selected = session.travelMode == mode
-                    Button {
-                        if mode == .custom {
-                            showEditor = true
-                        } else {
-                            session.travelMode = mode
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 6) {
+                    ForEach(TravelMode.allCases) { mode in
+                        let selected = session.travelMode == mode
+                        Button {
+                            if mode == .custom {
+                                showEditor = true
+                            } else {
+                                session.travelMode = mode
+                            }
+                        } label: {
+                            Image(systemName: mode.icon)
+                                .font(.body.weight(.semibold))
+                                .foregroundStyle(selected ? .black : .primary)
+                                .frame(width: 48, height: 44)
+                                .background(Capsule().fill(selected ? LocusTheme.accent : Color.primary.opacity(0.08)))
+                                .contentShape(Capsule())
                         }
-                    } label: {
-                        Image(systemName: mode.icon)
-                            .font(.body.weight(.semibold))
-                            .foregroundStyle(selected ? .black : .primary)
-                            .frame(minWidth: 44, maxWidth: .infinity, minHeight: 44)
-                            .background(Capsule().fill(selected ? LocusTheme.accent : Color.primary.opacity(0.08)))
-                            .contentShape(Capsule())
+                        .buttonStyle(.plain)
+                        .accessibilityLabel(mode.title)
+                        .accessibilityAddTraits(selected ? .isSelected : [])
                     }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel(mode.title)
-                    .accessibilityAddTraits(selected ? .isSelected : [])
                 }
             }
             HStack(spacing: 6) {
@@ -42,7 +44,7 @@ struct SpeedControls: View {
             NumericValueSheet(
                 title: String(localized: "Custom speed"),
                 unit: "km/h", value: $session.motionSettings.customSpeedKPH,
-                range: 0.1...300, step: 0.1,
+                range: 0.1...2000, step: 0.1,
                 help: String(localized: "Shared by joystick and routes. Changes apply while moving.")
             ) {
                 session.travelMode = .custom

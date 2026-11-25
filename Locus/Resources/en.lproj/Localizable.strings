@@ -255,3 +255,19 @@
 "Remote Pairing ports can change. Automatic mode uses the last working port, then discovers this device’s service via Bonjour. If discovery is unavailable, enter the same port used by SideStore. The VPN route and IP stay unchanged. Allow Local Network access for Locus or its container. Stop spoofing before editing." = "Remote Pairing ports can change. Automatic mode uses the last working port, then discovers this device’s service via Bonjour. If discovery is unavailable, enter the same port used by SideStore. The VPN route and IP stay unchanged. Allow Local Network access for Locus or its container. Stop spoofing before editing.";
 "Could not establish Remote Pairing. Check the service port and this app’s RPPairing file; a working VPN route alone does not verify them." = "Could not establish Remote Pairing. Check the service port and this app’s RPPairing file; a working VPN route alone does not verify them.";
 "Endpoint %@ · native error %d/%d" = "Endpoint %@ · native error %d/%d";
+
+// Travel simulation profiles (estimated movement; not live traffic)
+"Traffic drive" = "Traffic drive";
+"Airplane" = "Airplane";
+"Ship" = "Ship";
+"Taxi / takeoff" = "Taxi / takeoff";
+"Approach / landing" = "Approach / landing";
+"Cruising" = "Cruising";
+"Approaching port" = "Approaching port";
+"At sea" = "At sea";
+"Simulated junction stop" = "Simulated junction stop";
+"Traffic-style driving" = "Traffic-style driving";
+"Build direct waypoint route" = "Build direct waypoint route";
+"Flight and ship routes join waypoints directly. Add intermediate waypoints; a straight ship route might cross land. This is a simulation, not a navigation service." = "Flight and ship routes join waypoints directly. Add intermediate waypoints; a straight ship route might cross land. This is a simulation, not a navigation service.";
+"Driving follows Apple Maps roads, with simulated stops near some sharp junction turns. These are not actual traffic-light states or live traffic reports." = "Driving follows Apple Maps roads, with simulated stops near some sharp junction turns. These are not actual traffic-light states or live traffic reports.";
+"Estimated altitude: %.0f m (display only)" = "Estimated altitude: %.0f m (display only)";
